@@ -1,238 +1,344 @@
-// index.js
 require("dotenv").config();
 const express = require("express");
 const bodyParser = require("body-parser");
 const { Telegraf } = require("telegraf");
 const { v4: uuidv4 } = require("uuid");
 
+// اگر Node.js نسخهٔ قدیمی داری و global fetch وجود نداره، از node-fetch استفاده کن
+let fetchFunction = global.fetch;
+if (!fetchFunction) {
+    // dynamic import so module only required when needed
+    fetchFunction = (...args) =>
+        import("node-fetch").then(({ default: nf }) => nf(...args));
+}
+
+// --- Environment variables ---
 const BOT_TOKEN = process.env.BOT_TOKEN;
+const PERPLEXITY_API_KEY = process.env.PERPLEXITY_API_KEY;
+const PERPLEXITY_MODEL = process.env.PERPLEXITY_MODEL || "sonar";
 const SERVER_URL = process.env.SERVER_URL || "http://localhost:3000";
-const PORT = process.env.PORT || 3000;
+const SERVER_PORT = process.env.PORT || 3000;
 
-const bot = new Telegraf(BOT_TOKEN);
-const app = express();
-app.use(bodyParser.json());
+if (!BOT_TOKEN) {
+    console.error(
+        "Missing BOT_TOKEN in environment. Set BOT_TOKEN in your .env file."
+    );
+    process.exit(1);
+}
+if (!PERPLEXITY_API_KEY) {
+    console.warn(
+        "Warning: PERPLEXITY_API_KEY not set. Perplexity calls will fail until you set it."
+    );
+}
 
-/* === In-memory store (use Redis/DB in prod) === */
-const RES = new Map();
-/* RES entry:
-  {
-    id,
-    query,         // متن پرسش
-    creatorId,     // id کسی که inline query فرستاد (ctx.from.id)
-    pmMessageId,   // id پیام placeholder در PM (بات آن را ارسال کرده)
-    status,        // "pending" | "ready" | "failed"
-    answer,        // string
-    createdAt
-  }
+// --- Initialize bot and webserver ---
+const telegramBot = new Telegraf(BOT_TOKEN);
+const webApp = express();
+webApp.use(bodyParser.json());
+
+// --- In-memory reservation store (use Redis/DB in production) ---
+const reservationStore = new Map();
+/*
+reservation object shape:
+{
+  reservationId,
+  userQuery,
+  creatorTelegramId,    // user who initiated / chose inline result
+  privateMessageId,     // message_id of placeholder sent by bot in user's PM
+  status,               // "pending" | "ready" | "failed"
+  answerText,
+  createdAtTimestamp
+}
 */
 
-/* create reservation */
-function createReservation(query, creatorId) {
-    const id = uuidv4();
-    const item = {
-        id,
-        query,
-        creatorId: creatorId || null,
-        pmMessageId: null,
+// --- Helpers ---
+function createReservationEntry(userQueryText, creatorTelegramId) {
+    const reservationId = uuidv4();
+    const reservationEntry = {
+        reservationId,
+        userQuery: userQueryText,
+        creatorTelegramId: creatorTelegramId || null,
+        privateMessageId: null,
         status: "pending",
-        answer: null,
-        createdAt: Date.now(),
+        answerText: null,
+        createdAtTimestamp: Date.now(),
     };
-    RES.set(id, item);
-    return item;
-}
-function setReservationAnswer(id, answer) {
-    const r = RES.get(id);
-    if (!r) return null;
-    r.status = "ready";
-    r.answer = answer;
-    return r;
+    reservationStore.set(reservationId, reservationEntry);
+    return reservationEntry;
 }
 
-/* === Express endpoint for link page === */
-function escapeHtml(s = "") {
-    return String(s)
+function markReservationAsReady(reservationId, finalAnswerText) {
+    const reservationEntry = reservationStore.get(reservationId);
+    if (!reservationEntry) return null;
+    reservationEntry.status = "ready";
+    reservationEntry.answerText = finalAnswerText;
+    return reservationEntry;
+}
+
+function escapeHtmlForWeb(unsafeString = "") {
+    return String(unsafeString)
         .replaceAll("&", "&amp;")
         .replaceAll("<", "&lt;")
         .replaceAll(">", "&gt;");
 }
 
-app.get("/answer/:id", (req, res) => {
-    const id = req.params.id;
-    const r = RES.get(id);
-    if (!r) return res.status(404).send("<h3>Not found</h3>");
-    if (r.status === "pending") {
-        return res.send(`<html><body>
+// --- Perplexity API caller ---
+async function callPerplexityApi(userQuestion, options = {}) {
+    console.log("Calling Perplexity API with question:", userQuestion);
+
+    if (!PERPLEXITY_API_KEY) {
+        throw new Error("PERPLEXITY_API_KEY is not set in environment");
+    }
+
+    const requestPayload = {
+        model: PERPLEXITY_MODEL,
+        messages: [
+            { role: "system", content: "Be precise and concise." },
+            { role: "user", content: userQuestion },
+        ],
+    };
+
+    const timeoutMilliseconds = options.timeoutMilliseconds || 35000;
+    const abortController =
+        typeof AbortController !== "undefined" ? new AbortController() : null;
+    if (abortController)
+        setTimeout(() => abortController.abort(), timeoutMilliseconds);
+
+    const response = await fetchFunction(
+        "https://api.perplexity.ai/chat/completions",
+        {
+            method: "POST",
+            headers: {
+                Authorization: `Bearer ${PERPLEXITY_API_KEY}`,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify(requestPayload),
+            signal: abortController ? abortController.signal : undefined,
+        }
+    );
+
+    if (!response.ok) {
+        const responseText = await response.text().catch(() => "");
+        throw new Error(
+            `Perplexity API error ${response.status}: ${responseText}`
+        );
+    }
+
+    const responseJson = await response.json();
+    const returnedContent = responseJson?.choices?.[0]?.message?.content;
+    if (typeof returnedContent === "string" && returnedContent.length > 0) {
+        return returnedContent;
+    }
+
+    // fallbacks for unexpected shapes
+    if (typeof responseJson?.choices?.[0]?.message === "string")
+        return responseJson.choices[0].message;
+    if (typeof responseJson?.answer === "string") return responseJson.answer;
+    return JSON.stringify(responseJson);
+}
+
+// --- Express route: show reservation status / answer page ---
+webApp.get("/answer/:reservationId", (request, response) => {
+    const reservationId = request.params.reservationId;
+    const reservationEntry = reservationStore.get(reservationId);
+    if (!reservationEntry) {
+        return response.status(404).send("<h3>Not found</h3>");
+    }
+
+    if (reservationEntry.status === "pending") {
+        return response.send(`<html><body>
       <h3>جواب در حال آماده شدن است…</h3>
-      <p>سوال: ${escapeHtml(r.query)}</p>
-      <p>صفحه به‌طور خودکار به‌روزرسانی نمی‌شود — صبر کنید یا صفحه را رفرش کنید.</p>
+      <p>سوال: ${escapeHtmlForWeb(reservationEntry.userQuery)}</p>
+      <p>صفحه به‌طور خودکار به‌روزرسانی نمی‌شود — لطفاً صفحه را رفرش کنید.</p>
     </body></html>`);
     }
+
     // ready
-    return res.send(`<html><body>
+    return response.send(`<html><body>
     <h3>جواب شما</h3>
-    <pre style="white-space:pre-wrap; font-family:monospace;">${escapeHtml(
-        r.answer
+    <pre style="white-space:pre-wrap; font-family:monospace;">${escapeHtmlForWeb(
+        reservationEntry.answerText
     )}</pre>
   </body></html>`);
 });
 
-/* === Inline query handler ===
-   وقتی کاربر @YourBot ... تایپ می‌کنه، اینجا صدا زده می‌شه.
-   ما اینجا یک reservation می‌سازیم و یک InlineQueryResultArticle برمی‌گردونیم
-   که متنِ آن شامل لینک https://.../answer/<id> است.
-*/
-bot.on("inline_query", async (ctx) => {
+// --- Telegram inline_query handler ---
+// وقتی کاربر @YourBot ... تایپ می‌کند، برای او یک reservation ایجاد می‌کنیم و
+// نتیجه‌ای برمی‌گردانیم که لینک /answer/<reservationId> را شامل است.
+// همچنین switch_pm_parameter تنظیم می‌کنیم تا کاربر راحت به PM برود.
+telegramBot.on("inline_query", async (context) => {
     try {
-        const q = ctx.inlineQuery.query || "(no query)";
-        // ایجاد رزرو زودهنگام تا id داشته باشیم
-        const r = createReservation(q, ctx.inlineQuery.from.id);
+        const userQueryText = context.inlineQuery.query || "(no query)";
+        const newReservation = createReservationEntry(
+            userQueryText,
+            context.inlineQuery.from.id
+        );
 
-        const article = {
+        const inlineArticleResult = {
             type: "article",
-            id: r.id, // مهم: این id بعدها در chosen_inline_result می‌آید
-            title: `ارسال به‌صورت رزرو (AI)`,
+            id: newReservation.reservationId,
+            title: "ارسال به‌صورت رزرو (AI)",
             input_message_content: {
-                message_text: `درخواست ارسال شد. برای دیدن جواب به لینک زیر مراجعه کنید:\n\n${SERVER_URL}/answer/${r.id}`,
+                message_text: `سوال: ${userQueryText}\n\nدرخواست ارسال شد. برای دیدن جواب به لینک زیر مراجعه کنید:\n\n${SERVER_URL}/answer/${newReservation.reservationId}`,
             },
-            description: `ارسال سوال: ${q}`,
+            description: `ارسال سوال: ${userQueryText}`,
         };
 
-        // switch_pm_text و switch_pm_parameter: باعث می‌شه کاربر یک دکمه ببیند که مستقیم PM باز می‌کنه
-        await ctx.answerInlineQuery([article], {
+        await context.answerInlineQuery([inlineArticleResult], {
             cache_time: 0,
             is_personal: true,
             switch_pm_text: "مشاهده جواب کامل در پیام خصوصی با بات",
-            switch_pm_parameter: r.id,
+            switch_pm_parameter: newReservation.reservationId,
         });
-
-        // (اختیاری) می‌تونی بلافاصله یک PM هم ارسال کنی یا صبر کنی تا chosen_inline_result بیاد.
-        // ما صبر می‌کنیم تا chosen_inline_result — چون کاربر ممکنه نتیجه را انتخاب نکند.
-    } catch (err) {
-        console.error("inline_query err:", err);
+    } catch (error) {
+        console.error("inline_query handler error:", error);
     }
 });
 
-/* === chosen_inline_result handler ===
-   وقتی کاربر یک نتیجهٔ inline را انتخاب کنه، این آپدیت میاد.
-   result_id همان id‌ای است که در result گذاشتیم (پس reservation id داریم).
-   حالا بات یک پیام خصوصی placeholder به کاربر می‌فرستد و pmMessageId را ذخیره می‌کند.
-   سپس می‌توانیم پردازش AI را شروع کنیم؛ وقتی آماده شد، پیام را edit می‌کنیم.
-*/
-bot.on("chosen_inline_result", async (ctx) => {
+// TEST!
+// telegramBot.use(async (context, next) => {
+//     try {
+//         console.log(">>> incoming update type:", context.updateType);
+//         console.log(
+//             ">>> full update payload:",
+//             JSON.stringify(context.update, null, 2)
+//         );
+//     } catch (err) {
+//         console.warn("Logging error:", err);
+//     }
+//     return next();
+// });
+
+// --- Telegram chosen_inline_result handler ---
+// وقتی کاربر نتیجهٔ inline را انتخاب کرد، اینجا اجرا می‌شود.
+// بات یک پیام placeholder در PM کاربر می‌فرستد، سپس Perplexity را صدا می‌زند و
+// بعد پیام placeholder را edit می‌کند با جواب نهایی.
+telegramBot.on("chosen_inline_result", async (context) => {
+    console.log("in");
+
     try {
-        const resultId = ctx.update.chosen_inline_result.result_id;
-        const from = ctx.update.chosen_inline_result.from; // user who chose
-        const r = RES.get(resultId);
-        if (!r) {
+        const chosenResultId = context.update.chosen_inline_result.result_id;
+        const userWhoChose = context.update.chosen_inline_result.from;
+        const reservationEntry = reservationStore.get(chosenResultId);
+
+        console.log("Here");
+
+        if (!reservationEntry) {
             console.warn(
-                "chosen_inline_result: reservation not found for",
-                resultId
+                "chosen_inline_result: reservation not found for id:",
+                chosenResultId
             );
             return;
         }
 
-        // ثبت id کاربر (باز هم) برای اطمینان
-        r.creatorId = from.id;
+        // ثبت id کاربر که انتخاب را انجام داده
+        reservationEntry.creatorTelegramId = userWhoChose.id;
 
-        // ارسال پیام placeholder در PM به کاربر (بات مالک آن پیام خواهد بود)
-        const sent = await bot.telegram.sendMessage(
-            from.id,
-            `در حال پردازش سوال شما...\n\n(سوال: ${r.query})`
+        // ارسال پیام placeholder در پیام خصوصی کاربر
+        const placeholderMessage = await telegramBot.telegram.sendMessage(
+            userWhoChose.id,
+            `در حال پردازش سوال شما...\n\n(سوال: ${reservationEntry.userQuery})`
         );
-        r.pmMessageId = sent.message_id;
+        reservationEntry.privateMessageId = placeholderMessage.message_id;
 
-        // حالا پردازش AI را شروع می‌کنیم (مثال: mock)
-        mockCallAI(r.query)
-            .then(async (answer) => {
-                setReservationAnswer(r.id, answer);
+        // فراخوانی Perplexity برای گرفتن جواب
+        try {
+            const finalAnswer = await callPerplexityApi(
+                reservationEntry.userQuery,
+                { timeoutMilliseconds: 35000 }
+            );
+            markReservationAsReady(reservationEntry.reservationId, finalAnswer);
 
-                // ادیت پیام placeholder در PM
-                try {
-                    await bot.telegram.editMessageText(
-                        from.id,
-                        r.pmMessageId,
-                        null,
-                        `جواب شما:\n\n${answer}\n\n(لینک: ${SERVER_URL}/answer/${r.id})`
-                    );
-                } catch (err) {
-                    console.warn(
-                        "Could not edit PM placeholder, sending new message:",
-                        err.message
-                    );
-                    await bot.telegram.sendMessage(
-                        from.id,
-                        `جواب شما:\n\n${answer}\n\n(لینک: ${SERVER_URL}/answer/${r.id})`
-                    );
-                }
-            })
-            .catch(async (err) => {
-                console.error("AI error:", err);
-                r.status = "failed";
-                r.answer = "خطا در گرفتن جواب از AI";
-                try {
-                    await bot.telegram.editMessageText(
-                        from.id,
-                        r.pmMessageId,
-                        null,
-                        `خطا در پردازش پاسخ. لطفاً دوباره تلاش کنید.`
-                    );
-                } catch (_) {
-                    await bot.telegram.sendMessage(from.id, `خطا در پردازش.`);
-                }
-            });
-    } catch (err) {
-        console.error("chosen_inline_result handler err:", err);
+            // تلاش برای ویرایش پیام placeholder با جواب نهایی
+            try {
+                await telegramBot.telegram.editMessageText(
+                    userWhoChose.id,
+                    reservationEntry.privateMessageId,
+                    null,
+                    `جواب شما:\n\n${finalAnswer}\n\n(لینک: ${SERVER_URL}/answer/${reservationEntry.reservationId})`
+                );
+            } catch (editError) {
+                console.warn(
+                    "Could not edit private placeholder message, sending a new message:",
+                    editError.message
+                );
+                await telegramBot.telegram.sendMessage(
+                    userWhoChose.id,
+                    `جواب شما:\n\n${finalAnswer}\n\n(لینک: ${SERVER_URL}/answer/${reservationEntry.reservationId})`
+                );
+            }
+        } catch (perplexityError) {
+            console.error("Perplexity API call failed:", perplexityError);
+            reservationEntry.status = "failed";
+            reservationEntry.answerText = `خطا در گرفتن جواب از Perplexity: ${
+                perplexityError.message || perplexityError
+            }`;
+            try {
+                await telegramBot.telegram.editMessageText(
+                    userWhoChose.id,
+                    reservationEntry.privateMessageId,
+                    null,
+                    `خطا در پردازش پاسخ. لطفاً دوباره تلاش کنید.`
+                );
+            } catch (_) {
+                await telegramBot.telegram.sendMessage(
+                    userWhoChose.id,
+                    `خطا در پردازش.`
+                );
+            }
+        }
+    } catch (handlerError) {
+        console.error(
+            "chosen_inline_result handler encountered error:",
+            handlerError
+        );
     }
 });
 
-/* === Mock AI call ===
-   در عمل اینجا به سرویس AI خودت صدا می‌زنی و بعد پاسخ را ثبت می‌کنی.
-   اگر سرویس AI webhook داره، می‌تونی از /api/ai-callback استفاده کنی و
-   آنچه در بالا انجام می‌دهیم را از webhook انجام بدی.
-*/
-function mockCallAI(q) {
-    return new Promise((resolve) => {
-        setTimeout(() => {
-            resolve(`(پاسخ شبیه‌سازی‌شده برای) ${q}`);
-        }, 2500);
-    });
-}
+// --- Optional external AI callback endpoint ---
+// برای حالتی که سرویس AI به‌صورت webhook جواب را می‌فرستد
+webApp.post("/api/ai-callback", async (request, response) => {
+    const { reservationId, answerText } = request.body || {};
+    if (!reservationId || typeof answerText !== "string")
+        return response.status(400).send("bad");
 
-/* === Optional: external AI callback endpoint ===
-   اگر سرویس AI تو یک webhook برای جواب زدن داره، از این endpoint استفاده کن:
-   POST /api/ai-callback { id: "<reservation-id>", answer: "..." }
-   این endpoint reservation را آپدیت می‌کند و پیام PM را ویرایش می‌کند.
-*/
-app.post("/api/ai-callback", async (req, res) => {
-    const { id, answer } = req.body || {};
-    if (!id || typeof answer !== "string") return res.status(400).send("bad");
-    const r = setReservationAnswer(id, answer);
-    if (!r) return res.status(404).send("not found");
-    if (r.creatorId && r.pmMessageId) {
+    const updatedReservation = markReservationAsReady(
+        reservationId,
+        answerText
+    );
+    if (!updatedReservation) return response.status(404).send("not found");
+
+    if (
+        updatedReservation.creatorTelegramId &&
+        updatedReservation.privateMessageId
+    ) {
         try {
-            await bot.telegram.editMessageText(
-                r.creatorId,
-                r.pmMessageId,
+            await telegramBot.telegram.editMessageText(
+                updatedReservation.creatorTelegramId,
+                updatedReservation.privateMessageId,
                 null,
-                `جواب شما:\n\n${answer}\n\n(لینک: ${SERVER_URL}/answer/${r.id})`
+                `جواب شما:\n\n${answerText}\n\n(لینک: ${SERVER_URL}/answer/${updatedReservation.reservationId})`
             );
-        } catch (err) {
-            console.warn("editMessageText failed in ai-callback:", err.message);
-            await bot.telegram.sendMessage(
-                r.creatorId,
-                `جواب شما:\n\n${answer}\n\n(لینک: ${SERVER_URL}/answer/${r.id})`
+        } catch (editError) {
+            console.warn(
+                "editMessageText failed in ai-callback:",
+                editError.message
+            );
+            await telegramBot.telegram.sendMessage(
+                updatedReservation.creatorTelegramId,
+                `جواب شما:\n\n${answerText}\n\n(لینک: ${SERVER_URL}/answer/${updatedReservation.reservationId})`
             );
         }
     }
-    res.send({ ok: true });
+
+    return response.send({ ok: true });
 });
 
-/* === start servers === */
-app.listen(PORT, () => {
-    console.log("Web listening on", PORT);
+// --- Start servers ---
+webApp.listen(SERVER_PORT, () => {
+    console.log("Web server listening on", SERVER_PORT);
 });
-bot.launch().then(() => console.log("Bot launched"));
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+telegramBot.launch().then(() => console.log("Telegram bot launched"));
+
+process.once("SIGINT", () => telegramBot.stop("SIGINT"));
+process.once("SIGTERM", () => telegramBot.stop("SIGTERM"));
